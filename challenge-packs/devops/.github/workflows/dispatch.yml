@@ -1,0 +1,97 @@
+name: Grade Submission
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  dispatch-grader:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Load challenge config
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG=.challenge-config.json
+          echo "challenge_type=$(jq -r '.challenge_type' "$CONFIG")" >> "$GITHUB_OUTPUT"
+          echo "challenge_label=$(jq -r '.challenge_label' "$CONFIG")" >> "$GITHUB_OUTPUT"
+          echo "repo_prefix=$(jq -r '.repo_prefix' "$CONFIG")" >> "$GITHUB_OUTPUT"
+          echo "grader_repo=$(jq -r '.grader_repo' "$CONFIG")" >> "$GITHUB_OUTPUT"
+          echo "grade_event_type=$(jq -r '.grade_event_type' "$CONFIG")" >> "$GITHUB_OUTPUT"
+
+      - name: Count candidate PRs against main
+        id: pr_count
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              base: 'main',
+              state: 'all',
+            });
+            core.setOutput('count', String(prs.length));
+
+      - name: Create pending status comment
+        uses: actions/github-script@v7
+        env:
+          CHALLENGE_LABEL: ${{ steps.config.outputs.challenge_label }}
+        with:
+          script: |
+            const prCount = parseInt('${{ steps.pr_count.outputs.count }}', 10);
+            const challenge = process.env.CHALLENGE_LABEL;
+            const attempt = `(attempt ${prCount} of 2)`;
+            const body = prCount >= 2
+              ? `⏳ **${challenge} grading in progress** ${attempt} — your submission is being evaluated. Results will be posted here shortly.\n\n🔒 This is your final submission. Repository access will be set to read-only.`
+              : `⏳ **${challenge} grading in progress** ${attempt} — your submission is being evaluated. Results will be posted here shortly.\n\n💡 You will have one more attempt after this if needed.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
+
+      - name: Lock repo on second submission
+        if: ${{ steps.pr_count.outputs.count >= 2 }}
+        uses: actions/github-script@v7
+        env:
+          REPO_PREFIX: ${{ steps.config.outputs.repo_prefix }}
+        with:
+          github-token: ${{ secrets.CROSS_REPO_TOKEN }}
+          script: |
+            const repo = context.repo.repo;
+            const owner = context.repo.owner;
+            const prefix = `${process.env.REPO_PREFIX}-`;
+            if (!repo.startsWith(prefix)) {
+              core.info(`Repo "${repo}" doesn't match candidate pattern, skipping lock`);
+              return;
+            }
+            const username = repo.slice(prefix.length);
+            try {
+              await github.rest.repos.addCollaborator({ owner, repo, username, permission: 'pull' });
+              core.info(`${username} downgraded to pull (read-only)`);
+            } catch (e) {
+              core.warning(`Failed to downgrade ${username}: ${e.message}`);
+            }
+
+      - name: Dispatch grading to private repo
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          repository: ${{ github.repository_owner }}/${{ steps.config.outputs.grader_repo }}
+          event-type: ${{ steps.config.outputs.grade_event_type }}
+          client-payload: |
+            {
+              "challenge_type": "${{ steps.config.outputs.challenge_type }}",
+              "pr_repo": "${{ github.event.pull_request.head.repo.full_name }}",
+              "pr_ref": "${{ github.event.pull_request.head.sha }}",
+              "pr_number": "${{ github.event.pull_request.number }}",
+              "candidate_repo": "${{ github.repository }}",
+              "attempt": "${{ steps.pr_count.outputs.count }}"
+            }
